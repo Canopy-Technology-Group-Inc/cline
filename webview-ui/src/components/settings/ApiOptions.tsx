@@ -46,9 +46,12 @@ import {
 	vertexModels,
 	xaiDefaultModelId,
 	xaiModels,
+	sapAiCoreDefaultModelId,
+	sapAiCoreModels,
 } from "@shared/api"
 import { EmptyRequest, StringRequest } from "@shared/proto/common"
-import { OpenAiModelsRequest } from "@shared/proto/models"
+import { OpenAiModelsRequest, UpdateApiConfigurationRequest } from "@shared/proto/models"
+import { convertApiConfigurationToProto } from "@shared/proto-conversions/models/api-configuration-conversion"
 import {
 	VSCodeButton,
 	VSCodeCheckbox,
@@ -65,9 +68,11 @@ import styled from "styled-components"
 import * as vscodemodels from "vscode"
 import { useOpenRouterKeyInfo } from "../ui/hooks/useOpenRouterKeyInfo"
 import { ClineAccountInfoCard } from "./ClineAccountInfoCard"
+import OllamaModelPicker from "./OllamaModelPicker"
 import OpenRouterModelPicker, { ModelDescriptionMarkdown, OPENROUTER_MODEL_PICKER_Z_INDEX } from "./OpenRouterModelPicker"
 import RequestyModelPicker from "./RequestyModelPicker"
 import ThinkingBudgetSlider from "./ThinkingBudgetSlider"
+import { ExtensionMessage } from "@shared/ExtensionMessage"
 
 interface ApiOptionsProps {
 	showModelOptions: boolean
@@ -113,6 +118,31 @@ const OpenRouterBalanceDisplay = ({ apiKey }: { apiKey: string }) => {
 			Balance: {formattedBalance}
 		</VSCodeLink>
 	)
+}
+
+const SUPPORTED_THINKING_MODELS: Record<string, string[]> = {
+	anthropic: ["claude-3-7-sonnet-20250219", "claude-sonnet-4-20250514", "claude-opus-4-20250514"],
+	vertex: [
+		"claude-3-7-sonnet@20250219",
+		"claude-sonnet-4@20250514",
+		"claude-opus-4@20250514",
+		"gemini-2.5-flash-preview-05-20",
+		"gemini-2.5-flash-preview-04-17",
+		"gemini-2.5-pro-preview-06-05",
+	],
+	qwen: [
+		"qwen3-235b-a22b",
+		"qwen3-32b",
+		"qwen3-30b-a3b",
+		"qwen3-14b",
+		"qwen3-8b",
+		"qwen3-4b",
+		"qwen3-1.7b",
+		"qwen3-0.6b",
+		"qwen-plus-latest",
+		"qwen-turbo-latest",
+	],
+	gemini: ["gemini-2.5-flash-preview-05-20", "gemini-2.5-flash-preview-04-17", "gemini-2.5-pro-preview-06-05"],
 }
 
 // This is necessary to ensure dropdown opens downward, important for when this is used in popup
@@ -174,12 +204,19 @@ const ApiOptions = ({
 		if (saveImmediately && field === "apiProvider") {
 			// Use apiConfiguration from the full extensionState context to send the most complete data
 			const currentFullApiConfig = extensionState.apiConfiguration
-			vscode.postMessage({
-				type: "apiConfiguration",
-				apiConfiguration: {
-					...currentFullApiConfig, // Send the most complete config available
-					apiProvider: newValue, // Override with the new provider
-				},
+
+			// Convert to proto format and send via gRPC
+			const updatedConfig = {
+				...currentFullApiConfig,
+				apiProvider: newValue,
+			}
+			const protoConfig = convertApiConfigurationToProto(updatedConfig)
+			ModelsServiceClient.updateApiConfigurationProto(
+				UpdateApiConfigurationRequest.create({
+					apiConfiguration: protoConfig,
+				}),
+			).catch((error) => {
+				console.error("Failed to update API configuration:", error)
 			})
 		}
 	}
@@ -340,6 +377,7 @@ const ApiOptions = ({
 					<VSCodeOption value="xai">xAI</VSCodeOption>
 					<VSCodeOption value="sambanova">SambaNova</VSCodeOption>
 					<VSCodeOption value="cerebras">Cerebras</VSCodeOption>
+					<VSCodeOption value="sapaicore">SAP AI Core</VSCodeOption>
 				</VSCodeDropdown>
 			</DropdownContainer>
 
@@ -1031,15 +1069,6 @@ const ApiOptions = ({
 							</VSCodeLink>
 						)}
 					</p>
-
-					{/* Add Thinking Budget Slider specifically for gemini-2.5-flash-preview-04-17 */}
-					{selectedProvider === "gemini" && selectedModelId === "gemini-2.5-flash-preview-04-17" && (
-						<ThinkingBudgetSlider
-							apiConfiguration={apiConfiguration}
-							setApiConfiguration={setApiConfiguration}
-							maxBudget={selectedModelInfo.thinkingConfig?.maxBudget}
-						/>
-					)}
 				</div>
 			)}
 
@@ -1845,13 +1874,37 @@ const ApiOptions = ({
 						placeholder={"Default: http://localhost:11434"}>
 						<span style={{ fontWeight: 500 }}>Base URL (optional)</span>
 					</VSCodeTextField>
-					<VSCodeTextField
-						value={apiConfiguration?.ollamaModelId || ""}
-						style={{ width: "100%" }}
-						onInput={handleInputChange("ollamaModelId")}
-						placeholder={"e.g. llama3.1"}>
-						<span style={{ fontWeight: 500 }}>Model ID</span>
-					</VSCodeTextField>
+
+					{/* Model selection - use filterable picker */}
+					<label htmlFor="ollama-model-selection">
+						<span style={{ fontWeight: 500 }}>Model</span>
+					</label>
+					<OllamaModelPicker
+						ollamaModels={ollamaModels}
+						selectedModelId={apiConfiguration?.ollamaModelId || ""}
+						onModelChange={(modelId) => {
+							setApiConfiguration({
+								...apiConfiguration,
+								ollamaModelId: modelId,
+							})
+						}}
+						placeholder={ollamaModels.length > 0 ? "Search and select a model..." : "e.g. llama3.1"}
+					/>
+
+					{/* Show status message based on model availability */}
+					{ollamaModels.length === 0 && (
+						<p
+							style={{
+								fontSize: "12px",
+								marginTop: "3px",
+								color: "var(--vscode-descriptionForeground)",
+								fontStyle: "italic",
+							}}>
+							Unable to fetch models from Ollama server. Please ensure Ollama is running and accessible, or enter
+							the model ID manually above.
+						</p>
+					)}
+
 					<VSCodeTextField
 						value={apiConfiguration?.ollamaApiOptionsCtxNum || "32768"}
 						style={{ width: "100%" }}
@@ -1859,29 +1912,6 @@ const ApiOptions = ({
 						placeholder={"e.g. 32768"}>
 						<span style={{ fontWeight: 500 }}>Model Context Window</span>
 					</VSCodeTextField>
-					{ollamaModels.length > 0 && (
-						<VSCodeRadioGroup
-							value={
-								ollamaModels.includes(apiConfiguration?.ollamaModelId || "")
-									? apiConfiguration?.ollamaModelId
-									: ""
-							}
-							onChange={(e) => {
-								const value = (e.target as HTMLInputElement)?.value
-								// need to check value first since radio group returns empty string sometimes
-								if (value) {
-									handleInputChange("ollamaModelId")({
-										target: { value },
-									})
-								}
-							}}>
-							{ollamaModels.map((model) => (
-								<VSCodeRadio key={model} value={model} checked={apiConfiguration?.ollamaModelId === model}>
-									{model}
-								</VSCodeRadio>
-							))}
-						</VSCodeRadioGroup>
-					)}
 					<p
 						style={{
 							fontSize: "12px",
@@ -1889,12 +1919,12 @@ const ApiOptions = ({
 							color: "var(--vscode-descriptionForeground)",
 						}}>
 						Ollama allows you to run models locally on your computer. For instructions on how to get started, see
-						their
+						their{" "}
 						<VSCodeLink
 							href="https://github.com/ollama/ollama/blob/main/README.md"
 							style={{ display: "inline", fontSize: "inherit" }}>
 							quickstart guide.
-						</VSCodeLink>
+						</VSCodeLink>{" "}
 						<span style={{ color: "var(--vscode-errorForeground)" }}>
 							(<span style={{ fontWeight: 500 }}>Note:</span> Cline uses complex prompts and works best with Claude
 							models. Less capable models may not work as expected.)
@@ -2055,6 +2085,71 @@ const ApiOptions = ({
 				</div>
 			)}
 
+			{selectedProvider === "sapaicore" && (
+				<div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+					<VSCodeTextField
+						value={apiConfiguration?.sapAiCoreClientId || ""}
+						style={{ width: "100%" }}
+						type="password"
+						onInput={handleInputChange("sapAiCoreClientId")}
+						placeholder="Enter AI Core Client Id...">
+						<span style={{ fontWeight: 500 }}>AI Core Client Id</span>
+					</VSCodeTextField>
+					{apiConfiguration?.sapAiCoreClientId && (
+						<p style={{ fontSize: "12px", color: "var(--vscode-descriptionForeground)" }}>
+							Client Id is set. To change it, please re-enter the value.
+						</p>
+					)}
+					<VSCodeTextField
+						value={apiConfiguration?.sapAiCoreClientSecret ? "********" : ""}
+						style={{ width: "100%" }}
+						type="password"
+						onInput={handleInputChange("sapAiCoreClientSecret")}
+						placeholder="Enter AI Core Client Secret...">
+						<span style={{ fontWeight: 500 }}>AI Core Client Secret</span>
+					</VSCodeTextField>
+					{apiConfiguration?.sapAiCoreClientSecret && (
+						<p style={{ fontSize: "12px", color: "var(--vscode-descriptionForeground)" }}>
+							Client Secret is set. To change it, please re-enter the value.
+						</p>
+					)}
+					<VSCodeTextField
+						value={apiConfiguration?.sapAiCoreBaseUrl || ""}
+						style={{ width: "100%" }}
+						onInput={handleInputChange("sapAiCoreBaseUrl")}
+						placeholder="Enter AI Core Base URL...">
+						<span style={{ fontWeight: 500 }}>AI Core Base URL</span>
+					</VSCodeTextField>
+					<VSCodeTextField
+						value={apiConfiguration?.sapAiCoreTokenUrl || ""}
+						style={{ width: "100%" }}
+						onInput={handleInputChange("sapAiCoreTokenUrl")}
+						placeholder="Enter AI Core Auth URL...">
+						<span style={{ fontWeight: 500 }}>AI Core Auth URL</span>
+					</VSCodeTextField>
+					<VSCodeTextField
+						value={apiConfiguration?.sapAiResourceGroup || ""}
+						style={{ width: "100%" }}
+						onInput={handleInputChange("sapAiResourceGroup")}
+						placeholder="Enter AI Core Resource Group...">
+						<span style={{ fontWeight: 500 }}>AI Core Resource Group</span>
+					</VSCodeTextField>
+					<p
+						style={{
+							fontSize: "12px",
+							marginTop: "5px",
+							color: "var(--vscode-descriptionForeground)",
+						}}>
+						These credentials are stored locally and only used to make API requests from this extension.
+						<VSCodeLink
+							href="https://help.sap.com/docs/sap-ai-core/sap-ai-core-service-guide/access-sap-ai-core-via-api"
+							style={{ display: "inline" }}>
+							You can find more information about SAP AI Core API access here.
+						</VSCodeLink>
+					</p>
+				</div>
+			)}
+
 			{apiErrorMessage && (
 				<p
 					style={{
@@ -2174,27 +2269,16 @@ const ApiOptions = ({
 							{selectedProvider === "sambanova" && createDropdown(sambanovaModels)}
 							{selectedProvider === "cerebras" && createDropdown(cerebrasModels)}
 							{selectedProvider === "nebius" && createDropdown(nebiusModels)}
+							{selectedProvider === "sapaicore" && createDropdown(sapAiCoreModels)}
 						</DropdownContainer>
 
-						{selectedProvider === "anthropic" &&
-							(selectedModelId === "claude-3-7-sonnet-20250219" ||
-								selectedModelId === "claude-sonnet-4-20250514" ||
-								selectedModelId === "claude-opus-4-20250514") && (
-								<ThinkingBudgetSlider
-									apiConfiguration={apiConfiguration}
-									setApiConfiguration={setApiConfiguration}
-								/>
-							)}
-
-						{selectedProvider === "vertex" &&
-							(selectedModelId === "claude-3-7-sonnet@20250219" ||
-								selectedModelId === "claude-sonnet-4@20250514" ||
-								selectedModelId === "claude-opus-4@20250514") && (
-								<ThinkingBudgetSlider
-									apiConfiguration={apiConfiguration}
-									setApiConfiguration={setApiConfiguration}
-								/>
-							)}
+						{SUPPORTED_THINKING_MODELS[selectedProvider]?.includes(selectedModelId) && (
+							<ThinkingBudgetSlider
+								apiConfiguration={apiConfiguration}
+								setApiConfiguration={setApiConfiguration}
+								maxBudget={selectedModelInfo.thinkingConfig?.maxBudget}
+							/>
+						)}
 
 						{selectedProvider === "xai" && selectedModelId.includes("3-mini") && (
 							<>
@@ -2562,10 +2646,17 @@ export function normalizeApiConfiguration(apiConfiguration?: ApiConfiguration): 
 				selectedModelInfo: apiConfiguration?.requestyModelInfo || requestyDefaultModelInfo,
 			}
 		case "cline":
+			const openRouterModelId = apiConfiguration?.openRouterModelId || openRouterDefaultModelId
+			const openRouterModelInfo = apiConfiguration?.openRouterModelInfo || openRouterDefaultModelInfo
 			return {
 				selectedProvider: provider,
-				selectedModelId: apiConfiguration?.openRouterModelId || openRouterDefaultModelId,
-				selectedModelInfo: apiConfiguration?.openRouterModelInfo || openRouterDefaultModelInfo,
+				selectedModelId: openRouterModelId,
+				// TODO: remove this once we have a better way to handle free models on Cline
+				// Free grok 3 promotion
+				selectedModelInfo:
+					openRouterModelId === "x-ai/grok-3"
+						? { ...openRouterModelInfo, inputPrice: 0, outputPrice: 0 }
+						: openRouterModelInfo,
 			}
 		case "openai":
 			return {
@@ -2610,6 +2701,8 @@ export function normalizeApiConfiguration(apiConfiguration?: ApiConfiguration): 
 			return getProviderData(sambanovaModels, sambanovaDefaultModelId)
 		case "cerebras":
 			return getProviderData(cerebrasModels, cerebrasDefaultModelId)
+		case "sapaicore":
+			return getProviderData(sapAiCoreModels, sapAiCoreDefaultModelId)
 		default:
 			return getProviderData(anthropicModels, anthropicDefaultModelId)
 	}
